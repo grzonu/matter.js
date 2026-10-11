@@ -132,6 +132,7 @@ certTest("TC-ICDB-1.3", {
     pics: ["ICDB.C"],
     app: "lit-icd",
     controllers: { dut: "dut", th2: "helper" },
+    controllerCapabilities: ["icd-client"],
     appArgs: { th: TH_ARGS },
 
     // A TH that persists subscriptions sends no Check-In to a client with a persisted one, and the DUT holds a

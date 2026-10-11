@@ -4,7 +4,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { ClosedError, InternalError, Millis, TimeoutError, UnexpectedDataError } from "@matter/general";
+import {
+    ClosedError,
+    Diagnostic,
+    InternalError,
+    LogDestination,
+    Logger,
+    LogLevel,
+    Millis,
+    TimeoutError,
+    UnexpectedDataError,
+} from "@matter/general";
 import { expect } from "chai";
 import {
     MatterServerClient,
@@ -16,6 +26,23 @@ import { startStalledServer, waitFor } from "./fake-chip-tool.js";
 import { FAKE_SERVER_INFO, FakeMatterServer } from "./fake-matter-server.js";
 
 const BIG_NODE_ID = 0xfffffffe00000001n;
+
+async function infoLinesDuring(action: () => Promise<void>) {
+    const lines = new Array<string>();
+    Logger.destinations.capture = LogDestination({
+        add(message: Diagnostic.Message) {
+            if (message.level === LogLevel.INFO) {
+                lines.push(String(message.values[0]));
+            }
+        },
+    });
+    try {
+        await action();
+    } finally {
+        delete Logger.destinations.capture;
+    }
+    return lines;
+}
 
 describe("MatterServerClient", () => {
     let server: FakeMatterServer;
@@ -216,6 +243,21 @@ describe("MatterServerClient", () => {
             error = e;
         }
         expect(error).instanceOf(ClosedError);
+    });
+
+    it("logs once at info when the server drops the connection, and not when the client closes it", async () => {
+        const connected = await MatterServerClient.connect(server.url);
+        client = connected;
+        const lines = await infoLinesDuring(async () => {
+            server.dropClients();
+            await waitFor(() => server.connections === 0, "dropped connection");
+            await connected.close();
+        });
+        expect(lines.filter(line => line.includes("Connection to matterjs-server was lost"))).lengthOf(1);
+
+        const own = await MatterServerClient.connect(server.url);
+        const ownLines = await infoLinesDuring(() => own.close());
+        expect(ownLines).deep.equals([]);
     });
 
     it("rejects commands issued after the socket closed", async () => {

@@ -61,7 +61,8 @@ function runServer() {
             bluetooth_enabled: false,
         };
 
-        const server = new WebSocketServer({ host: "127.0.0.1", port: Number(args[portIndex + 1]) });
+        // The real server upgrades only this path, so a client connecting anywhere else must fail here too
+        const server = new WebSocketServer({ host: "127.0.0.1", port: Number(args[portIndex + 1]), path: "/ws" });
         server.on("connection", socket => socket.send(JSON.stringify(serverInfo)));
         server.on("listening", () => console.log("fake-server listening"));
     }

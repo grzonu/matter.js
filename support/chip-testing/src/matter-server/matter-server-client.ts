@@ -104,11 +104,15 @@ export class MatterServerClient {
     /** Events the server pushes after `start_listening`. */
     readonly events = Observable<[event: string, data: unknown]>();
 
+    /** Emitted once when the connection is gone, with the error pending commands were rejected with. */
+    readonly disconnected = Observable<[error: ClosedError]>();
+
     readonly #socket: WebSocket;
     readonly #pending = new Map<string, PendingCommand>();
     readonly #closed: Promise<void>;
     #nextId = 1;
     #isClosed = false;
+    #closeRequested = false;
     #closeCause?: Error;
 
     private constructor(
@@ -223,6 +227,7 @@ export class MatterServerClient {
 
     /** Close the connection, rejecting commands still pending. */
     async close(): Promise<void> {
+        this.#closeRequested = true;
         if (!this.#isClosed) {
             this.#socket.close();
         }
@@ -290,8 +295,20 @@ export class MatterServerClient {
     #onClose() {
         this.#isClosed = true;
         const error = this.#closedError();
+        if (!this.#closeRequested) {
+            logger.info(
+                `Connection to matterjs-server was lost, so subscription updates stop and pending commands fail${
+                    error.cause === undefined ? "" : `: ${error.cause}`
+                }`,
+            );
+        }
         for (const messageId of [...this.#pending.keys()]) {
             this.#settle(messageId)?.reject(error);
+        }
+        try {
+            this.disconnected.emit(error);
+        } catch (listenerError) {
+            logger.warn("Listener for the matterjs-server disconnect failed:", listenerError);
         }
     }
 

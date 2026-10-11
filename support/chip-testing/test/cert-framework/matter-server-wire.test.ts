@@ -4,11 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { Bytes, ImplementationError } from "@matter/general";
+import { Bytes, ImplementationError, UnexpectedDataError } from "@matter/general";
 import { expect } from "chai";
 import {
     decodeAttributeResult,
     decodeCommandResponse,
+    decodeInteractionReport,
     encodeAttributeValue,
     encodeCommandPayload,
     MatterServerUnmodeledError,
@@ -438,6 +439,132 @@ describe("matter-server wire codec", () => {
 
         it("refuses a command the cluster does not have", () => {
             expect(() => decodeCommandResponse(6, "NoSuchCommand", null)).throws(ImplementationError, /NoSuchCommand/);
+        });
+    });
+
+    // Event samples have the `node_event` shape `convertEventToWebSocket` builds on matterjs-server branch
+    // feat/cert-dut-controller, its data by `convertMatterToWebSocketNameBased` as for a command response.
+    describe("decodeInteractionReport", () => {
+        function event(
+            endpoint: number,
+            cluster: number,
+            eventId: number,
+            eventNumber: number | bigint,
+            data: unknown,
+        ) {
+            return {
+                node_id: 5,
+                endpoint_id: endpoint,
+                cluster_id: cluster,
+                event_id: eventId,
+                event_number: eventNumber,
+                priority: 1,
+                timestamp: 1704067200000,
+                timestamp_type: 1,
+                data,
+            };
+        }
+
+        it("decodes attributes, events and the statuses of both", () => {
+            const report = decodeInteractionReport({
+                attributes: { "1/6/0": true },
+                events: [event(1, 0x3b, 1, 121, { newPosition: 1 })],
+                attribute_status: { "1/6/9999": { status: 0x86 }, "1/1234/0": { status: 0xc3 } },
+                event_status: { "1/69/5": { status: 0xc7, cluster_status: 2 } },
+            });
+
+            expect([...report.attributes]).deep.equals([["1/6/0", { kind: "value", value: true }]]);
+            expect(report.events).deep.equals([
+                {
+                    endpoint: 1,
+                    cluster: 0x3b,
+                    event: 1,
+                    eventNumber: 121n,
+                    result: { kind: "value", value: { newPosition: 1 } },
+                },
+            ]);
+            expect([...report.attributeStatus]).deep.equals([
+                ["1/6/9999", { status: 0x86 }],
+                ["1/1234/0", { status: 0xc3 }],
+            ]);
+            expect([...report.eventStatus]).deep.equals([["1/69/5", { status: 0xc7, clusterStatus: 2 }]]);
+        });
+
+        it("reads absent status maps as no statuses", () => {
+            const report = decodeInteractionReport({ attributes: {}, events: [] });
+
+            expect(report.attributeStatus.size).equals(0);
+            expect(report.eventStatus.size).equals(0);
+        });
+
+        it("decodes event data by name through the event's own model", () => {
+            const [{ result }] = decodeInteractionReport({
+                attributes: {},
+                events: [
+                    event(0, 0x2a, 0, 2n ** 60n, {
+                        previousState: 1,
+                        newState: 4,
+                        reason: 1,
+                        targetSoftwareVersion: null,
+                    }),
+                ],
+            }).events;
+
+            expect(result).deep.equals({
+                kind: "value",
+                value: { previousState: 1, newState: 4, reason: 1, targetSoftwareVersion: null },
+            });
+        });
+
+        it("answers undefined for an event without data, as an in-process read does", () => {
+            for (const data of [null, {}]) {
+                const [{ result }] = decodeInteractionReport({
+                    attributes: {},
+                    events: [event(0, 0x28, 1, 7, data)],
+                }).events;
+
+                expect(result, show(data)).deep.equals({ kind: "value", value: undefined });
+            }
+        });
+
+        it("reports an event outside the model without failing the others", () => {
+            const { events } = decodeInteractionReport({
+                attributes: {},
+                events: [event(1, 0xfff1fc05, 1, 3, { arg1: 1 }), event(0, 0x28, 0, 4, { softwareVersion: 2 })],
+            });
+
+            expect(events[0].result.kind).equals("error");
+            if (events[0].result.kind === "error") {
+                expect(events[0].result.error).instanceOf(MatterServerUnmodeledError);
+            }
+            expect(events[1].result).deep.equals({ kind: "value", value: { softwareVersion: 2 } });
+        });
+
+        it("reports event data that does not fit its model", () => {
+            const [{ result }] = decodeInteractionReport({
+                attributes: {},
+                events: [event(0, 0x28, 0, 4, { softwareVersion: "two" })],
+            }).events;
+
+            if (result.kind !== "error") {
+                expect.fail("expected a decode error");
+            }
+            expect(result.error).instanceOf(MatterServerWireError);
+            expect(result.error.message).contains("0/40/0");
+        });
+
+        it("refuses a report that does not have the documented shape", () => {
+            for (const wire of [
+                null,
+                { attributes: {} },
+                { events: [] },
+                { attributes: {}, events: [{ endpoint_id: 1, cluster_id: 6, event_id: 0 }] },
+                { attributes: {}, events: [], attribute_status: [] },
+                { attributes: {}, events: [], event_status: { "1/2/3": { status: "busy" } } },
+                { attributes: {}, events: [], event_status: { "1/2/3": { status: 1, cluster_status: "x" } } },
+            ]) {
+                expect(() => decodeInteractionReport(wire), show(wire)).throws(UnexpectedDataError);
+            }
         });
     });
 });

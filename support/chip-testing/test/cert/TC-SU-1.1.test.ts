@@ -41,6 +41,7 @@ certTest("TC-SU-1.1", {
     pics: ["MCORE.ACL.Administrator", "OTAR.C.M.AnnounceOTAProvider"],
     app: "ota-requestor",
     devices: { th: "ota-requestor", th2: "ota-provider" },
+    controllerCapabilities: ["ota-provider"],
 })
     .step(
         "0",

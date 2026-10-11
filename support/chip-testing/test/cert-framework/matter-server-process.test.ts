@@ -7,16 +7,23 @@
 import { ClosedError, Millis, Seconds } from "@matter/general";
 import { CertConfigError } from "@matter/testing";
 import { expect } from "chai";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DISABLE_AUTO_SUBSCRIPTION_FLAG, MatterServerProcess } from "../../src/matter-server/matter-server-process.js";
+import {
+    DISABLE_AUTO_SUBSCRIPTION_FLAG,
+    MatterServerProcess,
+    type MatterServerProcessOptions,
+} from "../../src/matter-server/matter-server-process.js";
 import { waitFor } from "./fake-chip-tool.js";
 
 const ENTRY = fileURLToPath(new URL("./fixtures/fake-server-entry.mjs", import.meta.url));
 const CJS_ENTRY = fileURLToPath(new URL("./fixtures/fake-server-entry.cjs", import.meta.url));
+const EXIT_OWNER = fileURLToPath(new URL("./fixtures/exit-owner.mjs", import.meta.url));
+const PROCESS_MODULE = new URL("../../src/matter-server/matter-server-process.js", import.meta.url).href;
 interface Report {
     pid: number;
     storagePath: string;
@@ -62,14 +69,32 @@ describe("MatterServerProcess", () => {
     let server: MatterServerProcess | undefined;
     let reportDir: string;
     let reportFile: string;
+    let abandon: AbortController;
+    let starts: Promise<MatterServerProcess>[];
+
+    /** A start the test leaves behind, on its own timeout among others, is aborted in afterEach and its child stopped. */
+    function start(options: MatterServerProcessOptions) {
+        const starting = MatterServerProcess.start({ signal: abandon.signal, ...options });
+        starts.push(starting);
+        return starting;
+    }
 
     beforeEach(async () => {
+        abandon = new AbortController();
+        starts = [];
         reportDir = await mkdtemp(join(tmpdir(), "fake-server-report-"));
         reportFile = join(reportDir, "report.json");
         process.env.FAKE_SERVER_REPORT = reportFile;
     });
 
     afterEach(async () => {
+        abandon.abort();
+        // Each test checks the outcome of its own starts; closing is idempotent
+        for (const outcome of await Promise.allSettled(starts)) {
+            if (outcome.status === "fulfilled") {
+                await outcome.value.close();
+            }
+        }
         delete process.env.FAKE_SERVER_REPORT;
         await server?.close();
         server = undefined;
@@ -88,7 +113,7 @@ describe("MatterServerProcess", () => {
     }
 
     it("starts, connects and exposes stdout as log", async () => {
-        server = await MatterServerProcess.start({ entry: ENTRY, role: "dut-controller", primaryInterface: "en9" });
+        server = await start({ entry: ENTRY, role: "dut-controller", primaryInterface: "en9" });
 
         expect(server.client.serverInfo.sdk_version).equals("fake-server-entry");
         await waitFor(() => !!server?.log.lines.some(({ text }) => text === "fake-server listening"), "listening line");
@@ -102,29 +127,29 @@ describe("MatterServerProcess", () => {
     });
 
     it("runs a command line that ends in a script path as a command line", async () => {
-        server = await MatterServerProcess.start({ entry: `${process.execPath} ${ENTRY}`, role: "dut" });
+        server = await start({ entry: `${process.execPath} ${ENTRY}`, role: "dut" });
 
         expect(server.client.serverInfo.sdk_version).equals("fake-server-entry");
     });
 
     it("runs a .cjs file with the current Node", async () => {
-        server = await MatterServerProcess.start({ entry: CJS_ENTRY, role: "dut" });
+        server = await start({ entry: CJS_ENTRY, role: "dut" });
 
         expect(server.client.serverInfo.sdk_version).equals("fake-server-entry");
     });
 
     it("rejects an empty entry", async () => {
-        expect(await rejectionOf(MatterServerProcess.start({ entry: "  ", role: "dut" }))).instanceOf(CertConfigError);
+        expect(await rejectionOf(start({ entry: "  ", role: "dut" }))).instanceOf(CertConfigError);
     });
 
     it("omits --primary-interface when none is given", async () => {
-        server = await MatterServerProcess.start({ entry: ENTRY, role: "dut-controller" });
+        server = await start({ entry: ENTRY, role: "dut-controller" });
 
         expect(await argsFromLog(server)).not.includes("--primary-interface");
     });
 
     it("rejects with the last log lines when the child exits early", async () => {
-        const error = await rejectionOf(MatterServerProcess.start({ entry: withFlag("--exit-early"), role: "dut" }));
+        const error = await rejectionOf(start({ entry: withFlag("--exit-early"), role: "dut" }));
 
         expect(error).instanceOf(CertConfigError);
         const message = error instanceof Error ? error.message : "";
@@ -134,7 +159,7 @@ describe("MatterServerProcess", () => {
     });
 
     it("kills the child and removes storage on close", async () => {
-        server = await MatterServerProcess.start({ entry: ENTRY, role: "dut" });
+        server = await start({ entry: ENTRY, role: "dut" });
         const storage = storageOf(await argsFromLog(server));
         expect(existsSync(storage)).true;
 
@@ -149,7 +174,7 @@ describe("MatterServerProcess", () => {
     });
 
     it("shares one shutdown between repeated close calls", async () => {
-        server = await MatterServerProcess.start({ entry: ENTRY, role: "dut" });
+        server = await start({ entry: ENTRY, role: "dut" });
         const clientClose = server.client.close.bind(server.client);
         let clientCloses = 0;
         server.client.close = () => {
@@ -168,7 +193,7 @@ describe("MatterServerProcess", () => {
     });
 
     it("closes the websocket client when it closes", async () => {
-        server = await MatterServerProcess.start({ entry: ENTRY, role: "dut" });
+        server = await start({ entry: ENTRY, role: "dut" });
         const { client } = server;
         const clientClose = client.close.bind(client);
         let clientCloses = 0;
@@ -185,7 +210,7 @@ describe("MatterServerProcess", () => {
     });
 
     it("kills a child that ignores SIGTERM once the exit grace has passed", async () => {
-        server = await MatterServerProcess.start({
+        server = await start({
             entry: withFlag("--ignore-sigterm"),
             role: "dut",
             exitGrace: Millis(300),
@@ -204,7 +229,7 @@ describe("MatterServerProcess", () => {
     });
 
     it("removes storage after a failed start", async () => {
-        await rejectionOf(MatterServerProcess.start({ entry: withFlag("--exit-early"), role: "dut" }));
+        await rejectionOf(start({ entry: withFlag("--exit-early"), role: "dut" }));
 
         const report = await readReport();
         expect(existsSync(report.storagePath)).false;
@@ -215,15 +240,32 @@ describe("MatterServerProcess", () => {
         controller.abort();
 
         const error = await rejectionOf(
-            MatterServerProcess.start({ entry: withFlag("--never-listen"), role: "dut", signal: controller.signal }),
+            start({ entry: withFlag("--never-listen"), role: "dut", signal: controller.signal }),
         );
 
         expect(error).instanceOf(ClosedError);
     });
 
+    it("rejects with ClosedError before creating storage when the signal is already aborted", async () => {
+        const controller = new AbortController();
+        controller.abort();
+        const tmp = process.env.TMPDIR;
+        process.env.TMPDIR = join(reportDir, "missing");
+        try {
+            const error = await rejectionOf(start({ entry: ENTRY, role: "dut", signal: controller.signal }));
+            expect(error).instanceOf(ClosedError);
+        } finally {
+            if (tmp === undefined) {
+                delete process.env.TMPDIR;
+            } else {
+                process.env.TMPDIR = tmp;
+            }
+        }
+    });
+
     it("stops the child and removes storage when aborted while waiting for readiness", async () => {
         const controller = new AbortController();
-        const starting = MatterServerProcess.start({
+        const starting = start({
             entry: withFlag("--never-listen"),
             role: "dut",
             signal: controller.signal,
@@ -239,7 +281,7 @@ describe("MatterServerProcess", () => {
 
     it("stops the child and removes storage when readiness times out", async () => {
         const error = await rejectionOf(
-            MatterServerProcess.start({
+            start({
                 entry: withFlag("--never-listen"),
                 role: "dut",
                 readinessTimeout: Seconds(1),
@@ -251,5 +293,33 @@ describe("MatterServerProcess", () => {
         expect(message).contains("did not become ready within");
         expect(message).contains("fake-server not listening");
         await expectCleanedUp(await readReport());
+    });
+
+    it("kills its child when the owning process exits without closing it", async () => {
+        const owner = spawn(process.execPath, [EXIT_OWNER, PROCESS_MODULE, ENTRY], { stdio: "ignore" });
+        const code = await new Promise<number | null>(resolve => owner.once("exit", resolve));
+        const { pid, storagePath } = await readReport();
+        try {
+            expect(code).equals(0);
+            await waitFor(() => !isAlive(pid), "child killed");
+        } finally {
+            if (isAlive(pid)) {
+                process.kill(pid, "SIGKILL");
+            }
+            await rm(storagePath, { recursive: true, force: true });
+        }
+    });
+
+    it("holds one exit listener while children live and none once they ended", async () => {
+        const listeners = process.listenerCount("exit");
+        server = await start({ entry: ENTRY, role: "dut" });
+        const second = await start({ entry: ENTRY, role: "dut" });
+        expect(process.listenerCount("exit")).equals(listeners + 1);
+
+        await second.close();
+        expect(process.listenerCount("exit")).equals(listeners + 1);
+        await server.close();
+        server = undefined;
+        expect(process.listenerCount("exit")).equals(listeners);
     });
 });

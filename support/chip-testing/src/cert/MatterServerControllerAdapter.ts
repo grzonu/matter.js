@@ -6,10 +6,12 @@
 
 import type { Duration } from "@matter/general";
 import {
+    ClosedError,
     Diagnostic,
     ImplementationError,
     InternalError,
     isObject,
+    Logger,
     MatterError,
     Minutes,
     Mutex,
@@ -31,27 +33,38 @@ import type {
     ControllerAdapterOptions,
     ControllerCapability,
     ControllerCapabilityGaps,
+    EventPathSpec,
+    EventReadEntry,
     ManualPairingCodeFields,
     OnboardingPayloadFields,
     PicsValues,
     ReadAttributeOptions,
+    ReadEventOptions,
+    SubscribeEventOptions,
+    SubscribeOptions,
     TimedInteractionOptions,
 } from "@matter/testing";
 import { capabilitiesFor, CertConfigError, LogFollower, UnsupportedByControllerError } from "@matter/testing";
 import { env } from "node:process";
 import type { MatterServerClient } from "../matter-server/matter-server-client.js";
 import { MatterServerProcess } from "../matter-server/matter-server-process.js";
+import { MatterServerSubscriptions } from "../matter-server/matter-server-subscriptions.js";
 import {
     decodeAttributeResult,
     decodeCommandResponse,
+    decodeInteractionReport,
     encodeAttributeValue,
     encodeCommandPayload,
     MatterServerUnmodeledError,
-    type WireAttributeResult,
+    type WireEvent,
+    type WirePathStatus,
+    type WireValueResult,
 } from "../matter-server/matter-server-wire.js";
 import { findCertCluster } from "./custom-clusters.js";
 import { refusalOf, singleQrPayload } from "./onboarding-payload.js";
 import { timedInteractionTimeoutOf } from "./timed-interaction.js";
+
+const logger = Logger.get("MatterServerControllerAdapter");
 
 /** Name {@link UnsupportedByControllerError} reports for this adapter. */
 const CONTROLLER = "matterjs-server";
@@ -63,13 +76,10 @@ const CONTROLLER = "matterjs-server";
  */
 const COMMISSION_TIMEOUT = Minutes(5);
 
-/** `handleReadAttributes` sends at most this many paths per ReadRequest and splits a longer list into several. */
-const MAX_PATHS_PER_READ = 9;
-
-/** Concrete ids `splitAttributePath` on the server reads as wildcards. */
+/** Concrete ids `splitAttributePath` on the server reads as wildcards, for an event id as for an attribute id. */
 const WILDCARD_ENDPOINT = 0xffff;
 const WILDCARD_CLUSTER = 0xffffffff;
-const WILDCARD_ATTRIBUTE = 0xffffffff;
+const WILDCARD_LEAF = 0xffffffff;
 
 const DESCRIPTOR = 0x1d;
 const DEVICE_TYPE_LIST = 0;
@@ -96,27 +106,33 @@ export const MATTERJS_SERVER_CONTROLLER_PICS: PicsValues = {
     // `open_commissioning_window` ignores its `option` and always opens an enhanced window.
     "CADMIN.C.C01.Tx": 0,
 
-    // The server takes no BDX role, and its OTA provider is not reachable through this adapter yet.
-    "MCORE.BDX.Sender": 0,
-    "MCORE.BDX.Responder": 0,
-    "MCORE.BDX.SynchronousSender": 0,
+    // The server hosts matter.js's OTA provider, so it takes the BDX and OTA roles the in-process controller declares.
+    // The CHIP PICS file answers these for a device. What this adapter cannot drive of the provider is the
+    // `ota-provider` capability gap.
+    "MCORE.BDX.Sender": 1,
+    "MCORE.BDX.Responder": 1,
+    "MCORE.BDX.SynchronousSender": 1,
     "MCORE.BDX.AsynchronousSender": 0,
     "MCORE.BDX.BlockQueryWithSkip": 0,
-    "MCORE.OTA.Provider": 0,
-    "OTAR.C.M.AnnounceOTAProvider": 0,
-    "OTAP.S.M.DelayedActionTime": 0,
-    "OTAP.S.M.UserConsentNeeded": 0,
+    "MCORE.OTA.Provider": 1,
+    "MCORE.OTA.HTTPS": 0,
+    "OTAR.C.M.AnnounceOTAProvider": 1,
+    "OTAR.C.M.NotifyUpdateApplied": 0,
+    "OTAP.S.M.DelayedActionTime": 1,
+    "OTAP.S.M.UserConsentNeeded": 1,
 
-    // The server has an ICD client, but this adapter does not expose it.
-    "ICDB.C": 0,
-    "ICDM.C": 0,
+    // The server registers as an ICD Check-In client (`register_icd`). The CHIP PICS file answers only the server
+    // side. That this adapter does not expose the client is the `icd-client` capability gap.
+    "ICDB.C": 1,
 
-    // Started without its own subscriptions, the server holds a node as commissioning read it and maintains nothing
-    // a bridge later adds, renames or reports.
-    "MCORE.DEVLIST.UseDevices": 0,
-    "MCORE.DEVLIST.UseDeviceName": 0,
-    "MCORE.DEVLIST.UseDeviceState": 0,
-    "MCORE.DEVLIST.UseBatInfo": 0,
+    // The server is a bridge client that maintains the devices behind a bridge. The CHIP PICS file answers these for
+    // a device. That it maintains them only through a subscription of its own, which it runs without here, is the
+    // `sustained-subscription` capability gap.
+    "MCORE.BRIDGECLIENT": 1,
+    "MCORE.DEVLIST.UseDevices": 1,
+    "MCORE.DEVLIST.UseDeviceName": 1,
+    "MCORE.DEVLIST.UseDeviceState": 1,
+    "MCORE.DEVLIST.UseBatInfo": 1,
 
     // Client commands `device_command` sends for the cases that need them. The CHIP PICS file answers 0 for these
     // because it describes a device; here the client is the controller.
@@ -158,7 +174,8 @@ export const MATTERJS_SERVER_CONTROLLER_PICS: PicsValues = {
 
 /**
  * What this controller lacks, declared with its registration so a step needing one of these is skipped before it acts
- * (see `controllerCapabilityGap`). The adapter refuses each of them as well, before it sends anything.
+ * (see `controllerCapabilityGap`). The adapter refuses each operation that needs one of them as well, before it sends
+ * anything, except `clientEndpoints` and `clientAttribute`, which answer what the server holds.
  */
 export const MATTERJS_SERVER_CAPABILITY_GAPS = {
     "single-handshake-attempt":
@@ -168,19 +185,29 @@ export const MATTERJS_SERVER_CAPABILITY_GAPS = {
         "the WebSocket API has no commissioning timeout, so the server's own policy would decide when it stops looking",
     "group-messaging": "the WebSocket API has no group key management and no group addressing",
     "tcp-transport": "the server chooses the transport of each session itself and the WebSocket API cannot ask for one",
-    "data-versions": "read_attribute answers values without the cluster data versions",
+    "data-versions": "the read and subscribe results carry no cluster data versions",
     "unmodeled-data":
         "the server addresses only clusters and attributes of its own Matter model, and sends values outside it " +
         "lossily",
     attestation: "the server reads revocation from the DCL and the WebSocket API cannot install a revocation set",
     "webrtc-requestor": "the WebSocket API does not expose the server's requestor cluster to a case",
+    "ota-provider":
+        "the WebSocket API cannot stage an image with the server's OTA provider, report what it answered or script " +
+        "its answers",
+    "icd-client": "this adapter does not expose the server's ICD client",
+    "sustained-subscription":
+        "the server runs with --disable-auto-subscription so a case's own subscriptions are possible, so it holds no " +
+        "subscription of its own to observe events through or to keep its device list current",
 } as const satisfies ControllerCapabilityGaps;
 
 function refusal(capability: ControllerCapability, operation: string) {
     return new UnsupportedByControllerError(operation, CONTROLLER, MATTERJS_SERVER_CAPABILITY_GAPS[capability]);
 }
 
-/** A read the server answered without a value for a concrete path the step asked for. */
+/**
+ * A read or a subscription's priming report the server answered with neither a value nor a status for a concrete path
+ * the step asked for.
+ */
 export class MatterServerReadError extends MatterError {}
 
 /** What {@link MatterServerControllerAdapter} needs of a running server. {@link MatterServerProcess} is one. */
@@ -196,21 +223,30 @@ export interface MatterServerConnection {
     close(): Promise<void>;
 }
 
-/** Starts the server an adapter drives. */
-export type MatterServerLauncher = (role: string) => Promise<MatterServerConnection>;
+/**
+ * Starts the server an adapter drives. `signal` aborts when the adapter closes before the server is ready. The
+ * launcher must honour it and reject once it stopped what it started: `close()` waits for the launch to settle, so
+ * a launcher that ignores the signal blocks `close()` until the server is ready.
+ */
+export type MatterServerLauncher = (role: string, signal: AbortSignal) => Promise<MatterServerConnection>;
 
 /**
  * Starts matterjs-server from `MATTER_CERT_SERVER_ENTRY`, on the interface `MATTER_MDNS_NETWORKINTERFACE` names
  * where it is set.
  */
-async function launchFromEnvironment(role: string): Promise<MatterServerConnection> {
+async function launchFromEnvironment(role: string, signal: AbortSignal): Promise<MatterServerConnection> {
     const entry = env.MATTER_CERT_SERVER_ENTRY;
     if (entry === undefined || entry === "") {
         throw new CertConfigError(
             'MATTER_CERT_CONTROLLER="matterjs-server" needs MATTER_CERT_SERVER_ENTRY, the server entry point to run',
         );
     }
-    return MatterServerProcess.start({ entry, role, primaryInterface: env.MATTER_MDNS_NETWORKINTERFACE || undefined });
+    return MatterServerProcess.start({
+        entry,
+        role,
+        primaryInterface: env.MATTER_MDNS_NETWORKINTERFACE || undefined,
+        signal,
+    });
 }
 
 /**
@@ -220,20 +256,21 @@ async function launchFromEnvironment(role: string): Promise<MatterServerConnecti
  * Those with a PICS key are declared in {@link MATTERJS_SERVER_CONTROLLER_PICS}, and those a step states as a
  * controller capability in {@link MATTERJS_SERVER_CAPABILITY_GAPS}, so their steps are skipped before they run.
  *
- * The server runs without subscriptions of its own, so it holds a node as commissioning read it and reports no
- * events.
+ * The server runs with `--disable-auto-subscription`, so reads and subscriptions are the adapter's own: `read`,
+ * `subscribe` and `unsubscribe`. A `read` goes out as the in-process adapter sends it. To a `subscribe` the server adds
+ * the data versions it holds, so a priming report can leave out a cluster that did not change; a concrete path it
+ * leaves out fails with {@link MatterServerReadError}. The node's state the server holds changes only with what those
+ * report.
  *
- * Failures carry little structure:
+ * Statuses:
  *
+ * - A status a device answers a concrete read or subscribe path with surfaces as `StatusResponseError` with its
+ *   cluster status, as in-process.
  * - A status the device answers an invoke with surfaces as `MatterServerCommandError` with a message only.
- * - A read that returns values for only some of its paths fails with `MatterServerReadError` for the first concrete
- *   path without a value, because the server drops a path the device answered with a status. When every path is
- *   dropped, the server answers with an error and the read fails with `MatterServerCommandError` ("no values
- *   returned").
  * - A write's status code from the device surfaces as `StatusResponseError` without a cluster status. A write the
  *   server itself refuses surfaces as `MatterServerCommandError`.
  *
- * A step that asserts a particular status therefore fails rather than passing on the wrong one.
+ * A step that asserts an invoke's status therefore fails rather than passing on the wrong one.
  *
  * The server merges concurrent identical invokes into one request to the device, so the adapter sends the invokes of
  * one node one at a time, in call order.
@@ -243,8 +280,10 @@ export class MatterServerControllerAdapter implements ControllerAdapter {
 
     readonly #launch: MatterServerLauncher;
     readonly #invokeQueues = new Map<string, Mutex>();
+    readonly #closing = new AbortController();
+    #starting?: Promise<void>;
     #connection?: MatterServerConnection;
-    #closed = false;
+    #subscriptions?: MatterServerSubscriptions;
 
     constructor(id: string, options?: ControllerAdapterOptions, launch: MatterServerLauncher = launchFromEnvironment) {
         const [lacking] = capabilitiesFor(options);
@@ -273,25 +312,40 @@ export class MatterServerControllerAdapter implements ControllerAdapter {
     }
 
     async start(): Promise<void> {
-        if (this.#closed) {
+        if (this.#closing.signal.aborted) {
             throw new ImplementationError(`Controller adapter "${this.id}" was closed and cannot be restarted`);
         }
-        if (this.#connection !== undefined) {
-            throw new ImplementationError(`Controller adapter "${this.id}" was already started`);
+        if (this.#starting !== undefined) {
+            throw new ImplementationError(`Controller adapter "${this.id}": start() was already called`);
         }
-        const connection = await this.#launch(this.id);
-        if (this.#closed) {
-            await connection.close();
-            throw new ImplementationError(`Controller adapter "${this.id}" was closed while it started`);
-        }
-        this.#connection = connection;
+        this.#starting = this.#connect();
+        await this.#starting;
     }
 
+    async #connect() {
+        const connection = await this.#launch(this.id, this.#closing.signal);
+        if (this.#closing.signal.aborted) {
+            await connection.close();
+            throw new ClosedError(`Controller adapter "${this.id}" was closed while its server started`);
+        }
+        this.#connection = connection;
+        this.#subscriptions = new MatterServerSubscriptions(connection.client);
+    }
+
+    /** Also stops a server still starting, before it resolves. */
     async close(): Promise<void> {
-        this.#closed = true;
+        this.#closing.abort();
+        // start() reports its own failure to its caller
+        await Promise.allSettled([this.#starting]);
         const connection = this.#connection;
+        const subscriptions = this.#subscriptions;
         this.#connection = undefined;
-        await connection?.close();
+        this.#subscriptions = undefined;
+        try {
+            await subscriptions?.closeAll();
+        } finally {
+            await connection?.close();
+        }
     }
 
     get #started() {
@@ -299,6 +353,13 @@ export class MatterServerControllerAdapter implements ControllerAdapter {
             throw new ImplementationError(`Controller adapter "${this.id}" was used before start()`);
         }
         return this.#connection;
+    }
+
+    get #startedSubscriptions() {
+        if (this.#subscriptions === undefined) {
+            throw new ImplementationError(`Controller adapter "${this.id}" was used before start()`);
+        }
+        return this.#subscriptions;
     }
 
     async commission(target: CommissioningTarget): Promise<CertNodeRef> {
@@ -370,7 +431,12 @@ export class MatterServerControllerAdapter implements ControllerAdapter {
             queue = new Mutex(`matterjs-server invokes of node ${key}`);
             this.#invokeQueues.set(key, queue);
         }
-        return new MatterServerCertNodeApi(() => this.#started.client, ref, queue);
+        return new MatterServerCertNodeApi(
+            () => this.#started.client,
+            () => this.#startedSubscriptions,
+            ref,
+            queue,
+        );
     }
 
     group(_groupId: number): CertGroupApi {
@@ -390,11 +456,18 @@ class MatterServerCertGroupApi implements CertGroupApi {
 
 class MatterServerCertNodeApi implements CertNodeApi {
     readonly #client: () => MatterServerClient;
+    readonly #subscriptions: () => MatterServerSubscriptions;
     readonly #nodeId: NodeId;
     readonly #invokeQueue: Mutex;
 
-    constructor(client: () => MatterServerClient, ref: CertNodeRef, invokeQueue: Mutex) {
+    constructor(
+        client: () => MatterServerClient,
+        subscriptions: () => MatterServerSubscriptions,
+        ref: CertNodeRef,
+        invokeQueue: Mutex,
+    ) {
         this.#client = client;
+        this.#subscriptions = subscriptions;
         this.#invokeQueue = invokeQueue;
         this.#nodeId = NodeId(BigInt(ref));
     }
@@ -452,35 +525,26 @@ class MatterServerCertNodeApi implements CertNodeApi {
     }
 
     async readAttribute(path: AttributePathSpec, options?: ReadAttributeOptions): Promise<unknown> {
-        const values = await this.#read([path], options);
+        const report = await this.#readAttributes([path], options);
         const key = concreteKeyOf(path);
         if (key === undefined) {
-            return entriesOf(values);
+            return entriesOf(report.attributes);
         }
-        return valueAt(values, key);
+        throwIfRefused(report.attributeStatus, key, "readAttribute");
+        const entry = report.attributes.get(key);
+        if (entry === undefined) {
+            throw new MatterServerReadError(`matterjs-server returned neither a value nor a status for ${key}`);
+        }
+        return valueOf(entry, key);
     }
 
     async readAttributes(paths: AttributePathSpec[], options?: ReadAttributeOptions): Promise<AttributeReadEntry[]> {
         if (paths.length === 0) {
             throw new ImplementationError("readAttributes requires at least one path");
         }
-        if (paths.length > MAX_PATHS_PER_READ) {
-            throw new UnsupportedByControllerError(
-                "readAttributes",
-                CONTROLLER,
-                `${paths.length} paths do not fit the one ReadRequest this method promises; the server sends at most ` +
-                    `${MAX_PATHS_PER_READ} per request`,
-            );
-        }
-
-        const values = await this.#read(paths, options);
-        for (const path of paths) {
-            const key = concreteKeyOf(path);
-            if (key !== undefined) {
-                valueAt(values, key);
-            }
-        }
-        return entriesOf(values);
+        const report = await this.#readAttributes(paths, options);
+        throwIfAnyRefused(report.attributeStatus, paths.map(concreteKeyOf), "readAttributes");
+        return entriesOf(report.attributes);
     }
 
     async writeAttribute(path: AttributePathSpec, value: unknown, options?: TimedInteractionOptions): Promise<void> {
@@ -519,33 +583,112 @@ class MatterServerCertNodeApi implements CertNodeApi {
         );
     }
 
-    async subscribe(): Promise<never> {
-        throw new UnsupportedByControllerError(
-            "subscribe",
-            CONTROLLER,
-            "this adapter does not drive the server's subscriptions yet",
+    /**
+     * Keeps other subscriptions to the node, as the in-process adapter does: the server's default would end every
+     * other subscription of the controller to it.
+     */
+    async subscribe(path: AttributePathSpec, opts: SubscribeOptions): Promise<unknown> {
+        assertExpressible(path);
+        const key = pathKeyOf(path);
+        const subscription = await this.#subscriptions().open(
+            {
+                node_id: this.#nodeId,
+                attribute_paths: [key],
+                fabric_filtered: true,
+                min_interval: opts.minIntervalFloorSeconds,
+                max_interval: opts.maxIntervalCeilingSeconds,
+                keep_subscriptions: true,
+            },
+            `attribute ${key} of node ${this.#nodeId}`,
         );
+
+        let seed: unknown;
+        try {
+            const { attributes, attributeStatus } = subscription.priming;
+            const concrete = concreteKeyOf(path);
+            if (concrete === undefined) {
+                seed = entriesOf(attributes);
+            } else {
+                throwIfRefused(attributeStatus, concrete, "subscribe");
+                const entry = attributes.get(concrete);
+                if (entry === undefined) {
+                    throw new MatterServerReadError(
+                        `matterjs-server's priming report for subscription ${subscription.id} has neither a value ` +
+                            `nor a status for ${concrete}; the server can leave out a cluster that did not change, ` +
+                            "because it filters a subscribe by the data versions it holds",
+                    );
+                }
+                seed = valueOf(entry, concrete);
+            }
+        } catch (error) {
+            await subscription.close();
+            throw error;
+        }
+
+        subscription.listen(report => {
+            for (const [reported, entry] of report.attributes) {
+                deliverReported(() => valueOf(entry, reported), opts.onUpdate);
+            }
+        });
+        return seed;
     }
 
-    async readEvents(): Promise<never> {
-        throw new UnsupportedByControllerError("readEvents", CONTROLLER, "this adapter does not read events yet");
+    async readEvents(paths: EventPathSpec[], options?: ReadEventOptions): Promise<EventReadEntry[]> {
+        if (paths.length === 0) {
+            throw new ImplementationError("readEvents requires at least one path");
+        }
+        paths.forEach(assertExpressible);
+
+        const result = await this.#command("read", {
+            node_id: this.#nodeId,
+            event_paths: paths.map(path => ({ path: eventKeyOf(path) })),
+            ...eventFilterOf(options),
+        });
+        const { events, eventStatus } = decodeInteractionReport(result);
+        throwIfAnyRefused(eventStatus, paths.map(concreteEventKeyOf), "readEvents");
+        return events.map(eventEntryOf);
     }
 
-    async subscribeEvents(): Promise<never> {
-        throw new UnsupportedByControllerError(
-            "subscribeEvents",
-            CONTROLLER,
-            "this adapter does not drive the server's subscriptions yet",
+    /** Keeps other subscriptions to the node, as {@link subscribe} does. */
+    async subscribeEvents(paths: EventPathSpec[], opts: SubscribeEventOptions): Promise<EventReadEntry[]> {
+        if (paths.length === 0) {
+            throw new ImplementationError("subscribeEvents requires at least one path");
+        }
+        paths.forEach(assertExpressible);
+
+        const keys = paths.map(eventKeyOf);
+        const subscription = await this.#subscriptions().open(
+            {
+                node_id: this.#nodeId,
+                event_paths: keys.map(path => ({ path, is_urgent: opts.urgent })),
+                ...eventFilterOf(opts),
+                min_interval: opts.minIntervalFloorSeconds,
+                max_interval: opts.maxIntervalCeilingSeconds,
+                keep_subscriptions: true,
+            },
+            `events ${keys.join(", ")} of node ${this.#nodeId}`,
         );
+
+        let seed: EventReadEntry[];
+        try {
+            const { events, eventStatus } = subscription.priming;
+            throwIfAnyRefused(eventStatus, paths.map(concreteEventKeyOf), "subscribeEvents");
+            seed = events.map(eventEntryOf);
+        } catch (error) {
+            await subscription.close();
+            throw error;
+        }
+
+        subscription.listen(report => {
+            for (const event of report.events) {
+                deliverReported(() => eventEntryOf(event), opts.onUpdate);
+            }
+        });
+        return seed;
     }
 
     async observeEvents(): Promise<never> {
-        throw new UnsupportedByControllerError(
-            "observeEvents",
-            CONTROLLER,
-            "the server runs without a sustained subscription of its own, so there is none to observe events " +
-                "through, and the events a node already holds need an event read this adapter does not have yet",
-        );
+        throw refusal("sustained-subscription", "observeEvents");
     }
 
     async clientEndpoints(): Promise<ClientEndpointEntry[]> {
@@ -589,35 +732,19 @@ class MatterServerCertNodeApi implements CertNodeApi {
     }
 
     icdClient(): never {
-        throw new UnsupportedByControllerError(
-            "icdClient",
-            CONTROLLER,
-            "this adapter does not expose the server's ICD client",
-        );
+        throw refusal("icd-client", "icdClient");
     }
 
     async serveOtaUpdate(): Promise<never> {
-        throw new UnsupportedByControllerError(
-            "serveOtaUpdate",
-            CONTROLLER,
-            "this adapter does not stage images with the server's OTA provider yet",
-        );
+        throw refusal("ota-provider", "serveOtaUpdate");
     }
 
     async announceOtaProvider(): Promise<never> {
-        throw new UnsupportedByControllerError(
-            "announceOtaProvider",
-            CONTROLLER,
-            "this adapter does not report what the server's OTA provider answers",
-        );
+        throw refusal("ota-provider", "announceOtaProvider");
     }
 
     async scriptOtaProvider(): Promise<never> {
-        throw new UnsupportedByControllerError(
-            "scriptOtaProvider",
-            CONTROLLER,
-            "the server's OTA provider answers for itself and cannot be scripted",
-        );
+        throw refusal("ota-provider", "scriptOtaProvider");
     }
 
     async openCommissioningWindow(opts: {
@@ -658,7 +785,7 @@ class MatterServerCertNodeApi implements CertNodeApi {
         return getOperationalDeviceQname(compressedFabricId, this.#nodeId);
     }
 
-    async #read(paths: AttributePathSpec[], options?: ReadAttributeOptions) {
+    async #readAttributes(paths: AttributePathSpec[], options?: ReadAttributeOptions) {
         if (options?.dataVersions) {
             throw refusal("data-versions", "a read that reports data versions");
         }
@@ -667,16 +794,12 @@ class MatterServerCertNodeApi implements CertNodeApi {
         }
         paths.forEach(assertExpressible);
 
-        const keys = paths.map(pathKeyOf);
-        const result = await this.#command("read_attribute", {
+        const result = await this.#command("read", {
             node_id: this.#nodeId,
-            attribute_path: keys.length === 1 ? keys[0] : keys,
+            attribute_paths: paths.map(pathKeyOf),
             fabric_filtered: options?.fabricFiltered ?? true,
         });
-        if (!isObject(result)) {
-            throw new UnexpectedDataError(`matterjs-server answered read_attribute with ${Diagnostic.json(result)}`);
-        }
-        return decodeAttributeResult(result);
+        return decodeInteractionReport(result);
     }
 
     async #heldAttributes() {
@@ -700,11 +823,22 @@ function concreteKeyOf(path: AttributePathSpec) {
     return endpoint === undefined || cluster === undefined || attribute === undefined ? undefined : pathKeyOf(path);
 }
 
-function assertExpressible(path: AttributePathSpec) {
+/** The server's `"endpoint/cluster/event"` path, `*` for an absent segment. */
+function eventKeyOf({ endpoint, cluster, event }: EventPathSpec) {
+    return `${endpoint ?? "*"}/${cluster ?? "*"}/${event ?? "*"}`;
+}
+
+function concreteEventKeyOf(path: EventPathSpec) {
+    const { endpoint, cluster, event } = path;
+    return endpoint === undefined || cluster === undefined || event === undefined ? undefined : eventKeyOf(path);
+}
+
+function assertExpressible(path: { endpoint?: number; cluster?: number; attribute?: number; event?: number }) {
     if (
         path.endpoint === WILDCARD_ENDPOINT ||
         path.cluster === WILDCARD_CLUSTER ||
-        path.attribute === WILDCARD_ATTRIBUTE
+        path.attribute === WILDCARD_LEAF ||
+        path.event === WILDCARD_LEAF
     ) {
         throw new UnsupportedByControllerError(
             `addressing ${JSON.stringify(path)}`,
@@ -715,24 +849,59 @@ function assertExpressible(path: AttributePathSpec) {
 }
 
 /**
- * The server drops a path the device answered with a status rather than reporting it, so a concrete path without a
- * value failed for a reason the WebSocket API does not carry.
+ * A field left `undefined` is not sent, so without a `minEventNumber` the request carries no event filter at all, and
+ * an event path without `urgent` no IsUrgent flag.
  */
-function valueAt(values: Map<string, WireAttributeResult>, key: string) {
-    const entry = values.get(key);
-    if (entry === undefined) {
-        throw new MatterServerReadError(
-            `matterjs-server returned no value for ${key}; the server drops paths the device answered with a status`,
-        );
+function eventFilterOf(options?: ReadEventOptions) {
+    return { fabric_filtered: options?.fabricFiltered ?? true, event_min: options?.minEventNumber };
+}
+
+/**
+ * A concrete path the device answered with a status fails as in-process. A wildcard path's statuses are per-item
+ * results of its expansion, so those are not looked at.
+ */
+function throwIfRefused(statuses: Map<string, WirePathStatus>, key: string, operation: string) {
+    const refused = statuses.get(key);
+    if (refused !== undefined) {
+        throw new StatusResponseError(`${operation} ${key} failed`, refused.status, refused.clusterStatus);
     }
-    return valueOf(entry, key);
+}
+
+function throwIfAnyRefused(statuses: Map<string, WirePathStatus>, keys: (string | undefined)[], operation: string) {
+    for (const key of keys) {
+        if (key !== undefined) {
+            throwIfRefused(statuses, key, operation);
+        }
+    }
+}
+
+function eventEntryOf({ endpoint, cluster, event, eventNumber, result }: WireEvent): EventReadEntry {
+    return { endpoint, cluster, event, eventNumber, value: valueOf(result, `${endpoint}/${cluster}/${event}`) };
+}
+
+/**
+ * A value of a report after the priming report has no caller to fail, so one without an in-process equivalent is
+ * logged and left out.
+ */
+function deliverReported<T>(decode: () => T, deliver?: (value: T) => void) {
+    let value: T;
+    try {
+        value = decode();
+    } catch (error) {
+        if (!(error instanceof UnexpectedDataError) && !(error instanceof UnsupportedByControllerError)) {
+            throw error;
+        }
+        logger.warn("Left a value of a matterjs-server subscription report out:", error);
+        return;
+    }
+    deliver?.(value);
 }
 
 /**
  * A value the server sent for a path outside its model has nothing an in-process read would return to compare with,
  * which is a gap of this controller rather than a fault of the device.
  */
-function valueOf(entry: WireAttributeResult, key: string) {
+function valueOf(entry: WireValueResult, key: string) {
     if (entry.kind === "value") {
         return entry.value;
     }
@@ -752,7 +921,7 @@ function decodeManualPairingCode(code: string) {
  * A value that does not decode fails the whole read: an in-process read would have returned it, so leaving it out
  * would answer a step with less than the device reported.
  */
-function entriesOf(values: Map<string, WireAttributeResult>): AttributeReadEntry[] {
+function entriesOf(values: Map<string, WireValueResult>): AttributeReadEntry[] {
     const entries = new Array<AttributeReadEntry>();
     for (const [key, entry] of values) {
         const value = valueOf(entry, key);

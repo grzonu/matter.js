@@ -17,11 +17,36 @@ import { MatterServerClient } from "./matter-server-client.js";
 /** Makes the server leave attribute subscriptions to the cert test instead of subscribing on its own. */
 export const DISABLE_AUTO_SUBSCRIPTION_FLAG = "--disable-auto-subscription";
 
+/** The only path the server upgrades to its WebSocket API; a request to any other path is never answered. */
+export const WEBSOCKET_PATH = "/ws";
+
 const DEFAULT_READINESS_TIMEOUT = Seconds(30);
 const CONNECT_ATTEMPT_TIMEOUT = Seconds(2);
 const RETRY_INTERVAL = Millis(200);
 const EXIT_GRACE = Seconds(5);
 const FAILURE_LOG_LINES = 50;
+
+/** Killed when this process exits, also through `process.exit()`: nothing else ends a child with its parent. */
+const liveChildren = new Set<ChildProcess>();
+
+function killLiveChildren() {
+    for (const child of liveChildren) {
+        child.kill("SIGKILL");
+    }
+}
+
+function trackChild(child: ChildProcess) {
+    if (liveChildren.size === 0) {
+        process.on("exit", killLiveChildren);
+    }
+    liveChildren.add(child);
+}
+
+function untrackChild(child: ChildProcess) {
+    if (liveChildren.delete(child) && liveChildren.size === 0) {
+        process.off("exit", killLiveChildren);
+    }
+}
 
 export interface MatterServerProcessOptions {
     /**
@@ -92,6 +117,10 @@ export class MatterServerProcess {
             exitGrace = EXIT_GRACE,
         } = options;
 
+        if (signal?.aborted) {
+            throw new ClosedError("Starting matterjs-server was aborted before it began", { cause: signal.reason });
+        }
+
         const storagePath = await mkdtemp(join(tmpdir(), "matter-cert-server-"));
         const lines = new LineQueue();
         let child: ChildProcess | undefined;
@@ -126,16 +155,21 @@ export class MatterServerProcess {
 
             child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
             const spawned = child;
+            trackChild(spawned);
 
             const exit: ExitState = {};
             exited = new Promise<void>(resolve => {
                 // "close" follows "exit" once stdio is drained, so the last lines are in `recent` by then
                 spawned.once("close", (code, exitSignal) => {
+                    untrackChild(spawned);
                     exit.description = `exit code ${code ?? "none"}${exitSignal ? ` (signal ${exitSignal})` : ""}`;
                     resolve();
                 });
                 // A spawn failure (ENOENT) reports here, and "close" may not follow
                 spawned.on("error", cause => {
+                    if (spawned.pid === undefined) {
+                        untrackChild(spawned);
+                    }
                     onLine(`Error running ${command}: ${cause}`);
                     exit.description ??= "no exit code (failed to start)";
                     resolve();
@@ -150,7 +184,7 @@ export class MatterServerProcess {
             }
 
             const client = await connectWhenReady(
-                `ws://127.0.0.1:${port}`,
+                `ws://127.0.0.1:${port}${WEBSOCKET_PATH}`,
                 exited,
                 exit,
                 recent,

@@ -591,7 +591,9 @@ replaces a registration puts it back with it, and the capability declarations co
 with the current Node, or a command line (anything with whitespace). A command line must exec the server
 directly, because a wrapper such as `npx` may not pass SIGTERM on. The adapter starts one server per controller
 role with a temporary storage path and a free port, `--disable-auto-subscription`, `--enable-test-net-dcl` and
-`--log-level debug`. `MATTER_MDNS_NETWORKINTERFACE` becomes `--primary-interface`. Early exit and a missing
+`--log-level debug`, and connects to `ws://127.0.0.1:<port>/ws`: the server upgrades no other path and never answers
+a request to one, so a wrong path shows up only as a readiness timeout. Both fake servers in `test/cert-framework`
+accept only `/ws` too. `MATTER_MDNS_NETWORKINTERFACE` becomes `--primary-interface`. Early exit and a missing
 readiness are `CertConfigError`. The run record carries `controllerBuild` (entry, `sdkVersion`, `schemaVersion`),
 because the same variable can point at any build. The adapter reads it from `ControllerAdapter.build`.
 
@@ -605,8 +607,8 @@ answer: a controller that cannot send a command says nothing about the device, a
 "rejected" passes for the wrong reason. The mechanism:
 
 - `ControllerCapability` (`controller-adapter.ts`) names what a test may need: `single-handshake-attempt`,
-  `commissioning-give-up`, `group-messaging`, `tcp-transport`, `data-versions`, `unmodeled-data`, `attestation`
-  and `webrtc-requestor`.
+  `commissioning-give-up`, `group-messaging`, `tcp-transport`, `data-versions`, `unmodeled-data`, `attestation`,
+  `webrtc-requestor`, `ota-provider`, `icd-client` and `sustained-subscription`.
 - Each adapter lists what it lacks, with the reason, in `CHIP_TOOL_CAPABILITY_GAPS` and
   `MATTERJS_SERVER_CAPABILITY_GAPS`. The list is the fifth argument of `registerControllerAdapterFactory`.
   `controllerCapabilityGap()` and `controllerCapabilityGapsFor()` read it. The adapter builds its call-time refusal
@@ -627,11 +629,33 @@ matterjs device. The DD and SC-4.2 cases whose step 0 is the discriminator probe
 3.18, 3.20, 3.21 and TC-SC-4.2) skip as a whole, because their later commissioning steps rest on that probe; they
 declare `COMMISSIONING_GIVE_UP` (`tc-dd-support.ts`) at test level. TC-DD-3.16 and 3.17 declare it only on the steps
 that wait for a give-up, since no later step depends on them. TC-SC-3.5 (`single-handshake-attempt`), group cases
-(`group-messaging`) and the TCP block (`tcp-transport`) are capability-gated the same way.
+(`group-messaging`) and the TCP block (`tcp-transport`) are capability-gated the same way. So are, at test level, the
+cases whose DUT is the OTA provider (TC-SU-1.1, 3.1–3.4, TC-BDX-1.4, 2.1: `ota-provider`), the ICD client cases
+(TC-ICDB-1.3, TC-ICDM-6.1: `icd-client`) and TC-BR-4 (`sustained-subscription`), whose steps mostly wait for the DUT
+to notice what the bridge changes.
 
 **PICS.** `MATTERJS_SERVER_CONTROLLER_PICS` declares what the server is, as `MATTERJS_CONTROLLER_PICS` does for
-matter.js: no batched invoke, no BDX or OTA role, no ICD client, no device list, commissioner roles. A step gated
-on one of these keys skips through the PICS gate and counts as `picsSkips`.
+matter.js: commissioner roles, no batched invoke, no concatenated QR code, no basic commissioning window, and the BDX,
+OTA provider, ICD client and bridge client roles the server has. A key is never set to 0 only because this adapter
+cannot drive what the server does: that is a capability gap, so the step counts as a coverage gap of the controller
+(`controllerUnsupportedSkips`) instead of `picsSkips`.
+
+**Reads and subscriptions.** The adapter maps reads to the server's generic `read` (one Matter Read request, sent as
+given, `fabric_filtered` always explicit) and subscriptions to `subscribe`/`unsubscribe`, which the server allows only
+with `--disable-auto-subscription`. `read_attribute` is not used. Per-path `attribute_status`/`event_status` become
+`StatusResponseError` for a concrete path, as in-process; a wildcard path's statuses are dropped. Subscriptions are
+opened with `keep_subscriptions: true`, as in-process: the server's default ends every other subscription of the
+controller to the node. `MatterServerSubscriptions` routes `subscription_report`/`subscription_ended` by subscription
+id. The first report after the `subscribe` response is the priming report; a report can arrive before the response is
+handled, so frames for an unknown id are held while a `subscribe` is pending. Later reports are held until the caller
+has judged the priming report, so a subscription refused for a concrete path's status ends with `unsubscribe` and
+reports nothing. A subscription the server ends is dropped and logged at info; `close()` unsubscribes what is still
+open. A `subscribe` still waiting for its priming report fails with `ClosedError` at once when the adapter closes or
+the connection drops. Two differences remain: the server adds the data versions it knows to a `subscribe` request, so a
+priming report can leave out a cluster that did not change (a concrete `subscribe` then fails with
+`MatterServerReadError`, a wildcard one returns fewer entries); and results carry no data versions (`data-versions`
+gap). `MatterServerProcess` kills its live children on process exit, so a runner leaving through `process.exit()`
+orphans no server.
 
 **DUT-log checks.** A check that reads the controller's own log asks `dutControllerLogFlavor()` in `tc-support.ts`.
 chip-tool answers `chip`. The in-process controller and matterjs-server answer `matterjs`, because the server logs
@@ -1233,8 +1257,8 @@ belongs to, which is exactly what stopped `subscribe` from growing the same shap
 request's `EventFilters`; omitting it sends no filter at all, which is the optional case both plans
 describe.
 
-The in-process and chip-tool adapters implement them (the matterjs-server adapter refuses `readEvents`,
-`subscribeEvents` and `observeEvents`). `InProcessControllerAdapter` passes the paths straight to
+The in-process, chip-tool and matterjs-server adapters implement them (the matterjs-server adapter refuses
+`observeEvents` as its `sustained-subscription` gap). `InProcessControllerAdapter` passes the paths straight to
 `Read`/`Subscribe`'s own `events`/`eventFilters` options (`packages/protocol/src/action/request/`);
 `ChipToolControllerAdapter` runs `any read-event-by-id <clusters> <events> <node> <endpoints>` and
 `any subscribe-event-by-id <clusters> <events> <min> <max> <node> <endpoints>`, whose JSON results

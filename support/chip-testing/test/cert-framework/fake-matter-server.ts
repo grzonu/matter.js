@@ -8,6 +8,7 @@ import { InternalError, isObject } from "@matter/general";
 import { WebSocket, WebSocketServer } from "ws";
 import type { MatterServerInfo } from "../../src/matter-server/matter-server-client.js";
 import { parseBigIntAwareJson, toBigIntAwareJson } from "../../src/matter-server/matter-server-client.js";
+import { WEBSOCKET_PATH } from "../../src/matter-server/matter-server-process.js";
 
 export const FAKE_SERVER_INFO: MatterServerInfo = {
     fabric_id: 1,
@@ -66,7 +67,7 @@ export class FakeMatterServer {
     }
 
     static async start(serverInfo: object = FAKE_SERVER_INFO): Promise<FakeMatterServer> {
-        const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+        const server = new WebSocketServer({ host: "127.0.0.1", port: 0, path: WEBSOCKET_PATH });
         await new Promise<void>((resolve, reject) => {
             server.once("listening", resolve);
             server.once("error", reject);
@@ -82,8 +83,13 @@ export class FakeMatterServer {
         return address.port;
     }
 
+    /** Client connections currently open. */
+    get connections(): number {
+        return this.#sockets.size;
+    }
+
     get url(): string {
-        return `ws://127.0.0.1:${this.port}`;
+        return `ws://127.0.0.1:${this.port}${WEBSOCKET_PATH}`;
     }
 
     /** Answer a request left pending by {@link reply}. */

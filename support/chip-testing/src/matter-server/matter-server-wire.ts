@@ -23,8 +23,34 @@ export class MatterServerWireError extends UnexpectedDataError {}
 /** A {@link MatterServerWireError} for a path outside the Matter model, rather than a value that does not fit it. */
 export class MatterServerUnmodeledError extends MatterServerWireError {}
 
-/** One path of a decoded `read_attribute` result. */
-export type WireAttributeResult = { kind: "value"; value: unknown } | { kind: "error"; error: MatterServerWireError };
+/** One decoded attribute or event value, or the reason it has no in-process equivalent. */
+export type WireValueResult = { kind: "value"; value: unknown } | { kind: "error"; error: MatterServerWireError };
+
+/** One event of a `read` result or `subscription_report`, in the `node_event` shape. */
+export interface WireEvent {
+    endpoint: number;
+    cluster: number;
+    event: number;
+    eventNumber: bigint;
+    result: WireValueResult;
+}
+
+/** The status a device answered one path with instead of data. */
+export interface WirePathStatus {
+    status: number;
+    clusterStatus?: number;
+}
+
+/**
+ * A decoded `read` result or `subscription_report`. Status maps are keyed by the path in the request format, `*` where
+ * the device left a wildcard in the path.
+ */
+export interface WireInteractionReport {
+    attributes: Map<string, WireValueResult>;
+    events: WireEvent[];
+    attributeStatus: Map<string, WirePathStatus>;
+    eventStatus: Map<string, WirePathStatus>;
+}
 
 /**
  * How matterjs-server's `Converters.ts` treats a model. The classification is the server's own (`classifyModel`), so
@@ -289,8 +315,8 @@ function unmodeled(path: string, clusterId: number, attributeId: number) {
  * The wire does not carry a value's TLV width, so a 64-bit integer decodes as `bigint` only beyond 32 bits, which is
  * what a device's minimal-width encoding decodes to in-process.
  */
-export function decodeAttributeResult(wire: Record<string, unknown>): Map<string, WireAttributeResult> {
-    const result = new Map<string, WireAttributeResult>();
+export function decodeAttributeResult(wire: Record<string, unknown>): Map<string, WireValueResult> {
+    const result = new Map<string, WireValueResult>();
     for (const [path, value] of Object.entries(wire)) {
         try {
             result.set(path, { kind: "value", value: decodeAttributeValue(path, value) });
@@ -302,6 +328,118 @@ export function decodeAttributeResult(wire: Record<string, unknown>): Map<string
         }
     }
     return result;
+}
+
+function decodeEventValue(path: string, clusterId: number, eventId: number, wire: unknown): unknown {
+    const event = Matter.clusters(clusterId)?.events(eventId);
+    if (event === undefined) {
+        throw new MatterServerUnmodeledError(
+            `matterjs-server reported event ${path}, but cluster ${clusterId} event ${eventId} has no model; ` +
+                "the server sends such values lossily, so no value comparable to an in-process read exists",
+        );
+    }
+
+    // The server sends `null` for an event that carried no data, which an in-process read reports as `undefined`
+    if (wire === null) {
+        return undefined;
+    }
+
+    let value;
+    try {
+        value = fromWire(wire, event, "name");
+    } catch (cause) {
+        if (!(cause instanceof MatterServerWireError)) {
+            throw cause;
+        }
+        throw new MatterServerWireError(
+            `matterjs-server data of event ${path} (${event.name}) does not fit its model: ${Diagnostic.json(wire)}`,
+            { cause },
+        );
+    }
+
+    // An event without fields decodes in-process as `undefined`, and its TLV schema encodes no value at all
+    if (event.members.length === 0) {
+        return undefined;
+    }
+    return normalizeThroughTlv(TlvOfModel(event), value);
+}
+
+function isInteger(value: unknown): value is number | bigint {
+    return (typeof value === "number" && Number.isInteger(value)) || typeof value === "bigint";
+}
+
+function decodeEvent(wire: unknown): WireEvent {
+    if (
+        !isObject(wire) ||
+        typeof wire.endpoint_id !== "number" ||
+        typeof wire.cluster_id !== "number" ||
+        typeof wire.event_id !== "number" ||
+        !isInteger(wire.event_number)
+    ) {
+        throw new UnexpectedDataError(
+            `matterjs-server sent an event without its path or number: ${Diagnostic.json(wire)}`,
+        );
+    }
+    const { endpoint_id: endpoint, cluster_id: cluster, event_id: event } = wire;
+    const path = `${endpoint}/${cluster}/${event}`;
+
+    let result: WireValueResult;
+    try {
+        result = { kind: "value", value: decodeEventValue(path, cluster, event, wire.data) };
+    } catch (error) {
+        if (!(error instanceof MatterServerWireError)) {
+            throw error;
+        }
+        result = { kind: "error", error };
+    }
+    return { endpoint, cluster, event, eventNumber: BigInt(wire.event_number), result };
+}
+
+function decodeStatuses(wire: unknown, field: string): Map<string, WirePathStatus> {
+    const statuses = new Map<string, WirePathStatus>();
+    if (wire === undefined) {
+        return statuses;
+    }
+    if (!isObject(wire)) {
+        throw new UnexpectedDataError(`matterjs-server sent ${field} that is not an object: ${Diagnostic.json(wire)}`);
+    }
+    for (const [path, entry] of Object.entries(wire)) {
+        if (
+            !isObject(entry) ||
+            typeof entry.status !== "number" ||
+            (entry.cluster_status !== undefined && typeof entry.cluster_status !== "number")
+        ) {
+            throw new UnexpectedDataError(`matterjs-server sent ${field} for ${path} as ${Diagnostic.json(entry)}`);
+        }
+        statuses.set(
+            path,
+            entry.cluster_status === undefined
+                ? { status: entry.status }
+                : { status: entry.status, clusterStatus: entry.cluster_status },
+        );
+    }
+    return statuses;
+}
+
+/**
+ * A matterjs-server `read` result or `subscription_report` -> each value as the in-process adapter reports it for the
+ * same device data, and the statuses the device answered paths with.
+ *
+ * A value without an in-process equivalent leaves the others decoded, as {@link decodeAttributeResult}. A report that
+ * does not have the documented shape throws {@link UnexpectedDataError}.
+ */
+export function decodeInteractionReport(wire: unknown): WireInteractionReport {
+    if (!isObject(wire) || !isObject(wire.attributes) || !Array.isArray(wire.events)) {
+        throw new UnexpectedDataError(
+            `matterjs-server sent a report without attributes and events: ${Diagnostic.json(wire)}`,
+        );
+    }
+    return {
+        attributes: decodeAttributeResult(wire.attributes),
+        events: wire.events.map(decodeEvent),
+        attributeStatus: decodeStatuses(wire.attribute_status, "attribute_status"),
+        eventStatus: decodeStatuses(wire.event_status, "event_status"),
+    };
 }
 
 /**

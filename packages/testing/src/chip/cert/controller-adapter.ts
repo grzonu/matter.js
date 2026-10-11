@@ -1441,6 +1441,12 @@ export type ControllerRoleScope = "all-roles" | "dut-only";
  *   was built with: a custom cert cluster, a CHIP test cluster, an attribute newer than the model
  * - `attestation` — {@link ControllerAdapterOptions.attestation}
  * - `webrtc-requestor` — {@link ControllerAdapterOptions.webRtcRequestor}
+ * - `ota-provider` — an OTA provider of the controller's own that a case stages, announces and scripts:
+ *   {@link CertNodeApi.serveOtaUpdate}, {@link CertNodeApi.announceOtaProvider}, {@link CertNodeApi.scriptOtaProvider}
+ * - `icd-client` — {@link CertNodeApi.icdClient}
+ * - `sustained-subscription` — a subscription the controller keeps to a node on its own, which
+ *   {@link CertNodeApi.observeEvents} reports through and which keeps what {@link CertNodeApi.clientEndpoints} and
+ *   {@link CertNodeApi.clientAttribute} answer following the node
  *
  * An implementation states the ones it lacks when it registers (see {@link registerControllerAdapterFactory}), and a
  * step or test case states the ones it needs, so the engine skips it before it acts rather than letting a refusal
@@ -1454,7 +1460,10 @@ export type ControllerCapability =
     | "data-versions"
     | "unmodeled-data"
     | "attestation"
-    | "webrtc-requestor";
+    | "webrtc-requestor"
+    | "ota-provider"
+    | "icd-client"
+    | "sustained-subscription";
 
 /** The {@link ControllerCapability | capabilities} an implementation lacks, each with the reason it lacks it. */
 export type ControllerCapabilityGaps = Readonly<Partial<Record<ControllerCapability, string>>>;

@@ -212,6 +212,7 @@ certTest("TC-SU-3.4", {
     plan: "softwareupdate.adoc",
     pics: ["MCORE.OTA.Provider"],
     app: "ota-requestor",
+    controllerCapabilities: ["ota-provider"],
 
     // chip's ota-requestor-app ends the update at the download without this, so the ApplyUpdateRequest
     // this case is about would never be sent. chip's own Test_TC_SU_3_4 passes the same flag.
